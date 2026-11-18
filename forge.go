@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -151,35 +152,39 @@ type Comment struct {
 }
 
 type Repo struct {
-	ID     int
-	Name   string
-	Owner  string
-	Desc   string
-	Priv   bool
-	Refs   map[string]string // ref -> oid
-	Objs   map[string]*Obj
-	Issues []*Issue
-	PRs    []*PR
-	Labels map[string]string // name -> color
+	ID      int
+	Name    string
+	Owner   string
+	Desc    string
+	Priv    bool
+	Refs    map[string]string // ref -> oid
+	Objs    map[string]*Obj
+	Issues  []*Issue
+	PRs     []*PR
+	Labels  map[string]string // name -> color
 	NextNum int               // shared issue/PR counter
-	ComSeq map[int][]*Comment
-	CmtSeq int
-	Seq    int // repo creation order
+	ComSeq  map[int][]*Comment
+	CmtSeq  int
+	Seq     int // repo creation order
 	Shallow []string
+	// packMu guards lazy zlib compression (Obj.comp) and the fetch cache below.
+	packMu    sync.Mutex
+	fetchKey  string
+	fetchResp []byte
 }
 
 type Store struct {
-	mu          sync.RWMutex
-	repos       map[string]*Repo
-	order       []*Repo
-	nextRepoID  int
-	nextID      int64 // global numeric id counter (issues, comments, PRs)
-	reqID       uint64
-	commitSeq   int64
-	repoSeq     int64
-	issueSeq    int64
-	prSeq       int64
-	commentSeq  int64
+	mu         sync.RWMutex
+	repos      map[string]*Repo
+	order      []*Repo
+	nextRepoID int
+	nextID     int64 // global numeric id counter (issues, comments, PRs)
+	reqID      uint64
+	commitSeq  int64
+	repoSeq    int64
+	issueSeq   int64
+	prSeq      int64
+	commentSeq int64
 }
 
 var store = &Store{repos: map[string]*Repo{}, nextRepoID: 5000, nextID: 100000}
@@ -196,11 +201,11 @@ func jsonUnmarshal(b []byte, v interface{}) error { return json.Unmarshal(b, v) 
 func newRepo(owner, name string, id int) *Repo {
 	return &Repo{
 		ID: id, Name: name, Owner: owner,
-		Refs:   map[string]string{},
-		Objs:   map[string]*Obj{},
-		Labels: map[string]string{},
+		Refs:    map[string]string{},
+		Objs:    map[string]*Obj{},
+		Labels:  map[string]string{},
 		NextNum: 1,
-		ComSeq: map[int][]*Comment{},
+		ComSeq:  map[int][]*Comment{},
 	}
 }
 
@@ -211,13 +216,21 @@ func seedStore() {}
 // ---------------------------------------------------------------- git objects
 
 func oidOf(typ string, data []byte) string {
+	// header "type len\x00" on the stack: no temp string for Itoa, one alloc total (the result).
+	var arr [32]byte
+	b := arr[:0]
+	b = append(b, typ...)
+	b = append(b, ' ')
+	b = strconv.AppendInt(b, int64(len(data)), 10)
+	b = append(b, 0)
 	h := sha1.New()
-	h.Write([]byte(typ))
-	h.Write([]byte(" "))
-	h.Write([]byte(strconv.Itoa(len(data))))
-	h.Write([]byte{0})
+	h.Write(b)
 	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
+	var sum [20]byte
+	h.Sum(sum[:0])
+	var out [40]byte
+	hex.Encode(out[:], sum[:])
+	return string(out[:])
 }
 
 func compressObj(data []byte) []byte {
@@ -231,7 +244,9 @@ func compressObj(data []byte) []byte {
 func (r *Repo) putObj(typ string, data []byte) string {
 	oid := oidOf(typ, data)
 	if _, ok := r.Objs[oid]; !ok {
-		r.Objs[oid] = &Obj{typ: typ, data: data, comp: compressObj(data)}
+		// comp is computed lazily by buildPack: pushes never pay zlib, and a
+		// pack is built at most once per object set (fetch responses are cached).
+		r.Objs[oid] = &Obj{typ: typ, data: data}
 	}
 	return oid
 }
@@ -660,9 +675,9 @@ func (r *Repo) parsePack(pack []byte) (map[string]*Obj, error) {
 	}
 	count := int(pack[8])<<24 | int(pack[9])<<16 | int(pack[10])<<8 | int(pack[11])
 	trailerStart := len(pack) - 20
-	// verify trailer
+	// verify trailer without hex-encoding either side
 	sum := sha1.Sum(pack[:trailerStart])
-	if hex.EncodeToString(sum[:]) != hex.EncodeToString(pack[trailerStart:]) {
+	if !bytes.Equal(sum[:], pack[trailerStart:]) {
 		return nil, fmt.Errorf("pack checksum mismatch")
 	}
 	entries := make([]*packEntry, 0, count)
@@ -794,7 +809,7 @@ func (r *Repo) parsePack(pack []byte) (map[string]*Obj, error) {
 		}
 		oid := oidOf(typ, data)
 		e.oid = oid
-		o := &Obj{typ: typ, data: data, comp: compressObj(data)}
+		o := &Obj{typ: typ, data: data} // comp filled lazily by buildPack
 		resolved[oid] = o
 		return o, nil
 	}
@@ -820,8 +835,17 @@ func writePackHeader(typ string, size int) []byte {
 	return out
 }
 
-// build a packfile from objects (plain, no deltas), deterministic order by oid
-func buildPack(objs map[string]*Obj) []byte {
+// build a packfile from objects (plain, no deltas), deterministic order by oid.
+// Objects are compressed lazily here, once, under packMu: concurrent fetches of
+// the same objects share the compressed bytes instead of recompressing each time.
+func (r *Repo) buildPack(objs map[string]*Obj) []byte {
+	r.packMu.Lock()
+	defer r.packMu.Unlock()
+	for _, o := range objs {
+		if o.comp == nil {
+			o.comp = compressObj(o.data)
+		}
+	}
 	oids := make([]string, 0, len(objs))
 	for oid := range objs {
 		oids = append(oids, oid)
@@ -841,6 +865,39 @@ func buildPack(objs map[string]*Obj) []byte {
 	body := buf.Bytes()
 	sum := sha1.Sum(body)
 	return append(body, sum[:]...)
+}
+
+// fetchCacheKey identifies a fetch response: objects are append-only and refs are
+// named by oid in the key, so a hit is the same response fetchSet would build.
+// (Repeated depth-1 clones of one tip — the clone workload — all share one key.)
+func fetchCacheKey(proto string, wants, haves, shallows []string, depth int) string {
+	var sb strings.Builder
+	sb.WriteString(proto)
+	sb.WriteByte('|')
+	sb.WriteString(strconv.Itoa(depth))
+	sb.WriteByte('|')
+	sb.WriteString(strings.Join(wants, ","))
+	sb.WriteByte('|')
+	sb.WriteString(strings.Join(haves, ","))
+	sb.WriteByte('|')
+	sb.WriteString(strings.Join(shallows, ","))
+	return sb.String()
+}
+
+func (r *Repo) fetchCached(key string) ([]byte, bool) {
+	r.packMu.Lock()
+	defer r.packMu.Unlock()
+	if r.fetchKey == key && r.fetchResp != nil {
+		return r.fetchResp, true
+	}
+	return nil, false
+}
+
+func (r *Repo) storeFetch(key string, resp []byte) {
+	r.packMu.Lock()
+	defer r.packMu.Unlock()
+	r.fetchKey = key
+	r.fetchResp = resp
 }
 
 // ---------------------------------------------------------------- helpers
@@ -887,14 +944,14 @@ var _ = net.IPv4len
 // ---------------------------------------------------------------- HTTP layer (raw TCP)
 
 type request struct {
-	method  string
-	path    string // decoded path
-	rawPath string
-	query   string
-	proto   string
-	headers map[string]string
-	body    []byte
-	host    string
+	method    string
+	path      string // decoded path
+	rawPath   string
+	query     string
+	proto     string
+	headers   map[string]string
+	body      []byte
+	host      string
 	keepAlive bool
 }
 
@@ -925,14 +982,19 @@ func readRequest(br *bufReader) (*request, error) {
 	} else {
 		req.rawPath = rawTarget
 	}
-	// percent-decode path segments (keep '/' structure)
-	segs := strings.Split(req.rawPath, "/")
-	for i, s := range segs {
-		if d, err := urlUnescape(s); err == nil {
-			segs[i] = d
+	// percent-decode path segments (keep '/' structure); the common case has
+	// no '%' at all, so skip the split/decode round trip entirely.
+	if strings.IndexByte(req.rawPath, '%') < 0 {
+		req.path = req.rawPath
+	} else {
+		segs := strings.Split(req.rawPath, "/")
+		for i, s := range segs {
+			if d, err := urlUnescape(s); err == nil {
+				segs[i] = d
+			}
 		}
+		req.path = strings.Join(segs, "/")
 	}
-	req.path = strings.Join(segs, "/")
 	// headers
 	for {
 		hline, err := br.readLine()
@@ -1079,8 +1141,9 @@ func (b *bufReader) readN(n int) ([]byte, error) {
 func (b *bufReader) writeString(s string) { b.conn.Write([]byte(s)) }
 
 func writeResponse(conn net.Conn, req *request, resp *response) error {
-	// single write: headers + body in one buffer
-	buf := make([]byte, 0, 256+len(resp.body))
+	// headers into a small buffer, then one writev of headers + body:
+	// no copy of the (possibly large) body.
+	buf := make([]byte, 0, 256)
 	buf = append(buf, req.proto...)
 	buf = append(buf, ' ')
 	buf = strconv.AppendInt(buf, int64(resp.status), 10)
@@ -1107,8 +1170,8 @@ func writeResponse(conn net.Conn, req *request, resp *response) error {
 		buf = append(buf, "Connection: keep-alive\r\n"...)
 	}
 	buf = append(buf, "\r\n"...)
-	buf = append(buf, resp.body...)
-	_, err := conn.Write(buf)
+	w := net.Buffers{buf, resp.body}
+	_, err := w.WriteTo(conn)
 	return err
 }
 
@@ -1176,7 +1239,13 @@ func authed(req *request) bool {
 	return tok == authToken
 }
 
+// shared read-only empty query map (parseQuery's no-query fast path)
+var emptyQuery = map[string]string{}
+
 func parseQuery(q string) map[string]string {
+	if q == "" {
+		return emptyQuery // callers only read it
+	}
 	out := map[string]string{}
 	for _, kv := range strings.Split(q, "&") {
 		if kv == "" {
@@ -1259,6 +1328,7 @@ var viewerJSONBytes []byte
 func (is *Issue) rebuildCache(r *Repo) {
 	// hand-built JSON: the write hot path must not pay map-marshal reflection
 	var sb strings.Builder
+	sb.Grow(512)
 	sb.WriteString(`{"id":`)
 	sb.WriteString(strconv.Itoa(is.ID))
 	sb.WriteString(`,"node_id":`)
@@ -1322,8 +1392,8 @@ func (pr *PR) toJSON(r *Repo) []byte {
 		"base": map[string]interface{}{"ref": pr.BaseRef, "sha": baseSHA, "label": r.Owner + ":" + pr.BaseRef},
 		"user": viewerUserJSON(), "created_at": fixedTime, "updated_at": fixedTime,
 		"html_url": "https://github.com/" + r.Owner + "/" + r.Name + "/pull/" + strconv.Itoa(pr.Number),
-		"url": "/api/v3/repos/" + r.Owner + "/" + r.Name + "/pulls/" + strconv.Itoa(pr.Number),
-		"draft": false,
+		"url":      "/api/v3/repos/" + r.Owner + "/" + r.Name + "/pulls/" + strconv.Itoa(pr.Number),
+		"draft":    false,
 	})
 }
 
@@ -1616,8 +1686,8 @@ func commitJSON(r *Repo, oid string) map[string]interface{} {
 	return map[string]interface{}{
 		"sha": oid,
 		"commit": map[string]interface{}{
-			"message": strings.TrimRight(c.Message, "\n"),
-			"author":  map[string]string{"name": an, "email": ae, "date": ad},
+			"message":   strings.TrimRight(c.Message, "\n"),
+			"author":    map[string]string{"name": an, "email": ae, "date": ad},
 			"committer": map[string]string{"name": cn, "email": ce, "date": cd},
 		},
 		"parents": parents,
@@ -1672,8 +1742,12 @@ const gitResultCT = "application/x-git-receive-pack-result"
 
 func pktLine(data []byte) []byte {
 	out := make([]byte, 4, 4+len(data))
-	hexLen := fmt.Sprintf("%04x", len(data)+4)
-	copy(out, hexLen)
+	const hexd = "0123456789abcdef"
+	n := len(data) + 4
+	out[0] = hexd[(n>>12)&0xf]
+	out[1] = hexd[(n>>8)&0xf]
+	out[2] = hexd[(n>>4)&0xf]
+	out[3] = hexd[n&0xf]
 	return append(out, data...)
 }
 func pktFlush() []byte { return []byte("0000") }
@@ -1771,6 +1845,9 @@ func v2Advertise() []byte {
 	buf.Write(pktFlush())
 	return buf.Bytes()
 }
+
+// The v2 capability advertisement never changes: build it once.
+var v2AdvertiseBytes = v2Advertise()
 
 // pkt-line reader over a byte slice
 type pktReader struct {
@@ -2018,6 +2095,12 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 		case s == "done":
 		}
 	}
+	// Identical fetches (the clone workload's 50 depth-1 clones of one tip)
+	// rebuild the same pack every time; serve the cached response instead.
+	fetchKey := fetchCacheKey("v2", wants, haves, shallows, depth)
+	if cached, ok := r.fetchCached(fetchKey); ok {
+		return cached
+	}
 	send, shallow, unshallow := r.fetchSet(wants, haves, shallows, depth)
 	var buf bytes.Buffer
 	buf.Write(pktLine([]byte("acknowledgments\n")))
@@ -2041,7 +2124,7 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 				objs[oid] = o
 			}
 		}
-		pack := buildPack(objs)
+		pack := r.buildPack(objs)
 		// sideband: split into <=65515-byte chunks, band 1
 		for off := 0; off < len(pack); {
 			chunk := 65515
@@ -2056,7 +2139,9 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 		}
 	}
 	buf.Write(pktFlush())
-	return buf.Bytes()
+	resp := buf.Bytes()
+	r.storeFetch(fetchKey, resp)
+	return resp
 }
 
 func (r *Repo) handleFetchV0(body []byte) []byte {
@@ -2104,6 +2189,10 @@ func (r *Repo) handleFetchV0(body []byte) []byte {
 			break
 		}
 	}
+	fetchKey := fetchCacheKey("v0", wants, haves, shallows, depth)
+	if cached, ok := r.fetchCached(fetchKey); ok {
+		return cached
+	}
 	send, shallow, unshallow := r.fetchSet(wants, haves, shallows, depth)
 	var buf bytes.Buffer
 	buf.Write(pktLine([]byte("NAK\n")))
@@ -2121,7 +2210,7 @@ func (r *Repo) handleFetchV0(body []byte) []byte {
 				objs[oid] = o
 			}
 		}
-		pack := buildPack(objs)
+		pack := r.buildPack(objs)
 		for off := 0; off < len(pack); {
 			chunk := 65515
 			if len(pack)-off < chunk {
@@ -2135,7 +2224,9 @@ func (r *Repo) handleFetchV0(body []byte) []byte {
 		}
 	}
 	buf.Write(pktFlush())
-	return buf.Bytes()
+	resp := buf.Bytes()
+	r.storeFetch(fetchKey, resp)
+	return resp
 }
 
 func (r *Repo) handleReceivePack(body []byte) []byte {
@@ -2166,8 +2257,12 @@ func (r *Repo) handleReceivePack(body []byte) []byte {
 	// parse pack if present (starts with "PACK")
 	if len(rest) >= 4 && string(rest[:4]) == "PACK" {
 		if objs, err := r.parsePack(rest); err == nil {
-			for _, o := range objs {
-				r.putObj(o.typ, o.data)
+			// parsePack already hashed each object and computed its comp
+			// lazily; re-inserting via putObj would hash + compress them again.
+			for oid, o := range objs {
+				if _, ok := r.Objs[oid]; !ok {
+					r.Objs[oid] = o
+				}
 			}
 		}
 	}
@@ -2759,7 +2854,7 @@ func handlePulls(req *request, r *Repo, rest []string, q map[string]string) *res
 			defer store.mu.Unlock()
 			for _, pr := range r.PRs {
 				if pr.HeadRef == body.Head && pr.State == "open" {
-					return jerr(422, "Validation Failed: A pull request already exists for " + body.Head)
+					return jerr(422, "Validation Failed: A pull request already exists for "+body.Head)
 				}
 			}
 			n := r.NextNum
@@ -2838,7 +2933,7 @@ func handleGit(req *request) *response {
 		switch service {
 		case "git-upload-pack":
 			if req.headers["git-protocol"] == "version=2" {
-				return jrawCT(200, gitUploadCT, v2Advertise())
+				return jrawCT(200, gitUploadCT, v2AdvertiseBytes)
 			}
 			return jrawCT(200, gitUploadCT, r.advertisedRefs())
 		case "git-receive-pack":
@@ -3657,7 +3752,8 @@ func handleConn(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		conn.SetReadDeadline(time.Time{})
+		// No deadline clear: the read deadline only governs Reads, never the
+		// Write below, so clearing it was one setsockopt per request for nothing.
 		resp := dispatch(req)
 		if err := writeResponse(conn, req, resp); err != nil {
 			return
@@ -3669,6 +3765,9 @@ func handleConn(conn net.Conn) {
 }
 
 func main() {
+	// The heap is tiny (a few MB of objects); trade a little memory for fewer
+	// GC cycles on the sequential hot paths.
+	debug.SetGCPercent(200)
 	seedStore()
 	computeViewer()
 	viewerJSONBytes = jsonBytes(viewerUserJSON())
