@@ -1658,6 +1658,7 @@ func pktLine(data []byte) []byte {
 	return append(out, data...)
 }
 func pktFlush() []byte { return []byte("0000") }
+func pktDelim() []byte { return []byte("0001") }
 
 func (r *Repo) rawRefs() [][2]string {
 	// sorted by name: HEAD first
@@ -1680,7 +1681,7 @@ func (r *Repo) rawRefs() [][2]string {
 func (r *Repo) advertisedRefs() []byte {
 	// v0 upload-pack advertisement
 	var buf bytes.Buffer
-	buf.WriteString("# service=git-upload-pack\n")
+	buf.Write(pktLine([]byte("# service=git-upload-pack\n")))
 	buf.Write(pktFlush())
 	refs := r.rawRefs()
 	if len(refs) == 0 {
@@ -1710,7 +1711,7 @@ func (r *Repo) advertisedRefs() []byte {
 
 func (r *Repo) receiveAdvertisedRefs() []byte {
 	var buf bytes.Buffer
-	buf.WriteString("# service=git-receive-pack\n")
+	buf.Write(pktLine([]byte("# service=git-receive-pack\n")))
 	buf.Write(pktFlush())
 	refs := r.rawRefs()
 	if len(refs) == 0 {
@@ -1767,7 +1768,13 @@ func (p *pktReader) next() ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("bad pkt len")
 	}
-	if n == 0 {
+	if n == 1 {
+		// delim (0001) separates command args from arguments: skip it
+		p.pos += 4
+		return p.next()
+	}
+	if n == 0 || n == 2 {
+		// flush (0000) / response-end (0002): end of stream
 		p.pos += 4
 		return nil, true, nil
 	}
@@ -1962,7 +1969,7 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(pktLine([]byte("acknowledgments\n")))
 	buf.Write(pktLine([]byte("NAK\n")))
-	buf.Write(pktFlush())
+	buf.Write(pktDelim())
 	if len(shallow) > 0 || len(unshallow) > 0 {
 		buf.Write(pktLine([]byte("shallow-info\n")))
 		for _, s := range shallow {
@@ -1971,7 +1978,7 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 		for _, s := range unshallow {
 			buf.Write(pktLine([]byte("unshallow " + s + "\n")))
 		}
-		buf.Write(pktFlush())
+		buf.Write(pktDelim())
 	}
 	if len(send) > 0 {
 		buf.Write(pktLine([]byte("packfile\n")))
