@@ -970,18 +970,12 @@ func readRequest(br *bufReader) (*request, error) {
 	if err != nil {
 		return nil, err
 	}
-	// parse "METHOD TARGET PROTO" without SplitN (no slice alloc)
-	sp1 := strings.IndexByte(line, ' ')
-	if sp1 < 0 {
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) != 3 {
 		return nil, fmt.Errorf("bad request line")
 	}
-	sp2 := strings.IndexByte(line[sp1+1:], ' ')
-	if sp2 < 0 {
-		return nil, fmt.Errorf("bad request line")
-	}
-	sp2 += sp1 + 1
-	req := &request{method: line[:sp1], proto: line[sp2+1:], headers: map[string]string{}}
-	rawTarget := line[sp1+1 : sp2]
+	req := &request{method: parts[0], proto: parts[2], headers: map[string]string{}}
+	rawTarget := parts[1]
 	if i := strings.Index(rawTarget, "?"); i >= 0 {
 		req.rawPath = rawTarget[:i]
 		req.query = rawTarget[i+1:]
@@ -1094,10 +1088,6 @@ type bufReader struct {
 	conn net.Conn
 	buf  []byte
 	r, w int
-	// lastDeadlineSet: read deadlines are refreshed lazily (once per 5s) so a
-	// keep-alive connection doing thousands of requests does not pay a
-	// setsockopt per request; idle connections still time out at ~30-35s.
-	lastDeadlineSet time.Time
 }
 
 func newBufReader(c net.Conn) *bufReader { return &bufReader{conn: c, buf: make([]byte, 65536)} }
@@ -3756,12 +3746,8 @@ func handleConn(conn net.Conn) {
 	defer conn.Close()
 	br := newBufReader(conn)
 	for {
-		// read timeout to avoid hanging idle keep-alive forever; refreshed
-		// lazily (see bufReader.lastDeadlineSet) to skip a setsockopt per request
-		if time.Since(br.lastDeadlineSet) > 5*time.Second {
-			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-			br.lastDeadlineSet = time.Now()
-		}
+		// read timeout to avoid hanging idle keep-alive forever
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		req, err := readRequest(br)
 		if err != nil {
 			return
