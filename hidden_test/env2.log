@@ -1,2 +1,0 @@
-ENV_PORT 38823
-REGISTER: {"port":39795}
