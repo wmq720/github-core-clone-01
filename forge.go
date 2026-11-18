@@ -1079,42 +1079,37 @@ func (b *bufReader) readN(n int) ([]byte, error) {
 func (b *bufReader) writeString(s string) { b.conn.Write([]byte(s)) }
 
 func writeResponse(conn net.Conn, req *request, resp *response) error {
-	var sb strings.Builder
-	sb.WriteString(req.proto)
-	sb.WriteByte(' ')
-	sb.WriteString(strconv.Itoa(resp.status))
-	sb.WriteByte(' ')
-	sb.WriteString(statusText(resp.status))
-	sb.WriteString("\r\nContent-Type: ")
-	sb.WriteString(resp.ctype)
-	sb.WriteString("\r\nContent-Length: ")
-	sb.WriteString(strconv.Itoa(len(resp.body)))
-	sb.WriteString("\r\nX-GitHub-Request-Id: req-")
-	sb.WriteString(strconv.FormatUint(store.nextReqID(), 10))
-	sb.WriteString("\r\n")
+	// single write: headers + body in one buffer
+	buf := make([]byte, 0, 256+len(resp.body))
+	buf = append(buf, req.proto...)
+	buf = append(buf, ' ')
+	buf = strconv.AppendInt(buf, int64(resp.status), 10)
+	buf = append(buf, ' ')
+	buf = append(buf, statusText(resp.status)...)
+	buf = append(buf, "\r\nContent-Type: "...)
+	buf = append(buf, resp.ctype...)
+	buf = append(buf, "\r\nContent-Length: "...)
+	buf = strconv.AppendInt(buf, int64(len(resp.body)), 10)
+	buf = append(buf, "\r\nX-GitHub-Request-Id: req-"...)
+	buf = strconv.AppendUint(buf, store.nextReqID(), 10)
+	buf = append(buf, "\r\n"...)
 	for k, v := range resp.extra {
-		sb.WriteString(k)
-		sb.WriteString(": ")
-		sb.WriteString(v)
-		sb.WriteString("\r\n")
+		buf = append(buf, k...)
+		buf = append(buf, ": "...)
+		buf = append(buf, v...)
+		buf = append(buf, "\r\n"...)
 	}
 	if !req.keepAlive || resp.status == 204 {
 		if resp.status != 204 {
-			sb.WriteString("Connection: close\r\n")
+			buf = append(buf, "Connection: close\r\n"...)
 		}
 	} else {
-		sb.WriteString("Connection: keep-alive\r\n")
+		buf = append(buf, "Connection: keep-alive\r\n"...)
 	}
-	sb.WriteString("\r\n")
-	if _, err := conn.Write([]byte(sb.String())); err != nil {
-		return err
-	}
-	if len(resp.body) > 0 {
-		if _, err := conn.Write(resp.body); err != nil {
-			return err
-		}
-	}
-	return nil
+	buf = append(buf, "\r\n"...)
+	buf = append(buf, resp.body...)
+	_, err := conn.Write(buf)
+	return err
 }
 
 func statusText(code int) string {
@@ -1259,30 +1254,54 @@ func (r *Repo) tip(ref string) string {
 	return r.Refs[ref]
 }
 
+var viewerJSONBytes []byte
+
 func (is *Issue) rebuildCache(r *Repo) {
-	labels := []map[string]string{}
-	for _, ln := range is.Labels {
+	// hand-built JSON: the write hot path must not pay map-marshal reflection
+	var sb strings.Builder
+	sb.WriteString(`{"id":`)
+	sb.WriteString(strconv.Itoa(is.ID))
+	sb.WriteString(`,"node_id":`)
+	sb.WriteString(strconv.Quote(is.GID))
+	sb.WriteString(`,"number":`)
+	sb.WriteString(strconv.Itoa(is.Number))
+	sb.WriteString(`,"title":`)
+	sb.WriteString(strconv.Quote(is.Title))
+	sb.WriteString(`,"body":`)
+	sb.WriteString(strconv.Quote(is.Body))
+	sb.WriteString(`,"state":`)
+	sb.WriteString(strconv.Quote(is.State))
+	sb.WriteString(`,"labels":[`)
+	for i, ln := range is.Labels {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
 		color := r.Labels[ln]
 		if color == "" {
 			color = "ededed"
 		}
-		labels = append(labels, map[string]string{"name": ln, "color": color, "description": ""})
+		sb.WriteString(`{"name":`)
+		sb.WriteString(strconv.Quote(ln))
+		sb.WriteString(`,"color":`)
+		sb.WriteString(strconv.Quote(color))
+		sb.WriteString(`,"description":""}`)
 	}
-	if labels == nil {
-		labels = []map[string]string{}
-	}
-	closed := interface{}(nil)
+	sb.WriteString(`],"user":`)
+	sb.Write(viewerJSONBytes)
+	sb.WriteString(`,"assignee":null,"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z","closed_at":`)
 	if is.State == "closed" {
-		closed = "2025-01-02T00:00:00Z"
+		sb.WriteString(`"2025-01-02T00:00:00Z"`)
+	} else {
+		sb.WriteString(`null`)
 	}
-	is.cache = jsonBytes(map[string]interface{}{
-		"id": is.ID, "node_id": is.GID, "number": is.Number, "title": is.Title, "body": is.Body,
-		"state": is.State, "labels": labels, "user": viewerUserJSON(), "assignee": nil,
-		"created_at": fixedTime, "updated_at": fixedTime, "closed_at": closed,
-		"html_url": "https://github.com/" + r.Owner + "/" + r.Name + "/issues/" + strconv.Itoa(is.Number),
-		"url": "/api/v3/repos/" + r.Owner + "/" + r.Name + "/issues/" + strconv.Itoa(is.Number),
-		"comments": len(r.ComSeq[is.Number]),
-	})
+	sb.WriteString(`,"html_url":`)
+	sb.WriteString(strconv.Quote("https://github.com/" + r.Owner + "/" + r.Name + "/issues/" + strconv.Itoa(is.Number)))
+	sb.WriteString(`,"url":`)
+	sb.WriteString(strconv.Quote("/api/v3/repos/" + r.Owner + "/" + r.Name + "/issues/" + strconv.Itoa(is.Number)))
+	sb.WriteString(`,"comments":`)
+	sb.WriteString(strconv.Itoa(len(r.ComSeq[is.Number])))
+	sb.WriteByte('}')
+	is.cache = []byte(sb.String())
 }
 
 func (pr *PR) toJSON(r *Repo) []byte {
@@ -1597,7 +1616,7 @@ func commitJSON(r *Repo, oid string) map[string]interface{} {
 	return map[string]interface{}{
 		"sha": oid,
 		"commit": map[string]interface{}{
-			"message": c.Message,
+			"message": strings.TrimRight(c.Message, "\n"),
 			"author":  map[string]string{"name": an, "email": ae, "date": ad},
 			"committer": map[string]string{"name": cn, "email": ce, "date": cd},
 		},
@@ -3107,7 +3126,7 @@ func execGraphQL(doc map[string]interface{}) interface{} {
 		pr := &PR{ID: id, GID: "pr-" + strconv.Itoa(r.ID) + "-" + strconv.Itoa(n), Number: n, Title: title, State: "open", HeadRef: head, BaseRef: base}
 		r.PRs = append(r.PRs, pr)
 		store.mu.Unlock()
-		return map[string]interface{}{"data": map[string]interface{}{"createPullRequest": map[string]interface{}{"pullRequest": map[string]interface{}{"id": pr.GID, "number": pr.Number, "title": pr.Title}}}}
+		return map[string]interface{}{"data": map[string]interface{}{"createPullRequest": map[string]interface{}{"pullRequest": map[string]interface{}{"id": pr.GID, "number": pr.Number, "title": pr.Title, "state": "OPEN", "headRefName": head, "baseRefName": base}}}}
 	}
 	if strings.Contains(q, "mergePullRequest") {
 		prID := gqlString(vars["pullRequestId"])
@@ -3652,6 +3671,7 @@ func handleConn(conn net.Conn) {
 func main() {
 	seedStore()
 	computeViewer()
+	viewerJSONBytes = jsonBytes(viewerUserJSON())
 	authToken = os.Getenv("MAKEFUN_SHOP_TOKEN")
 	if authToken == "" {
 		fmt.Fprintln(os.Stderr, "MAKEFUN_SHOP_TOKEN not set")
