@@ -1687,7 +1687,7 @@ func (r *Repo) advertisedRefs() []byte {
 	if len(refs) == 0 {
 		buf.Write(pktLine([]byte("0000000000000000000000000000000000000000 capabilities^{}\x00side-band-64k multi_ack thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=forge/1.0\n")))
 	} else {
-		caps := "side-band-64k multi_ack thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=forge/1.0"
+		caps := "side-band-64k multi_ack multi_ack_detailed thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=forge/1.0"
 		for i, rf := range refs {
 			line := rf[0] + " " + rf[1]
 			if i == 0 {
@@ -1812,13 +1812,22 @@ func (r *Repo) handleLsRefs(body []byte) []byte {
 	}
 	var buf bytes.Buffer
 	tip := r.tip("main")
-	headLine := ""
-	if tip != "" {
-		headLine = tip + " HEAD symref-target:refs/heads/main"
-	} else {
-		headLine = "0000000000000000000000000000000000000000 HEAD symref-target:refs/heads/main"
+	// HEAD is only listed when no prefix filter is given or a prefix matches it
+	showHead := len(prefixes) == 0
+	for _, pre := range prefixes {
+		if strings.HasPrefix("HEAD", pre) || strings.HasPrefix(pre, "HEAD") {
+			showHead = true
+		}
 	}
-	buf.Write(pktLine([]byte(headLine + "\n")))
+	if showHead {
+		headLine := ""
+		if tip != "" {
+			headLine = tip + " HEAD symref-target:refs/heads/main"
+		} else {
+			headLine = "0000000000000000000000000000000000000000 HEAD symref-target:refs/heads/main"
+		}
+		buf.Write(pktLine([]byte(headLine + "\n")))
+	}
 	refs := r.rawRefs()
 	for _, rf := range refs {
 		if rf[1] == "HEAD" {
@@ -1850,23 +1859,50 @@ func (r *Repo) handleLsRefs(body []byte) []byte {
 	return buf.Bytes()
 }
 
-// compute fetch send set: wants minus held closure, bounded by depth
-func (r *Repo) fetchSet(wants []string, haves []string, depth int) (send []string, shallow []string, unshallow []string) {
+// compute fetch send set: wants minus held closure, bounded by depth.
+// shallowBounds are previous shallow boundaries: the client holds them but
+// NOT their parents, so their ancestors must not count as held.
+func (r *Repo) fetchSet(wants []string, haves []string, shallowBounds []string, depth int) (send []string, shallow []string, unshallow []string) {
 	held := map[string]bool{}
 	for _, h := range haves {
 		for oid := range r.closure([]string{h}) {
 			held[oid] = true
 		}
 	}
-	// BFS from wants up to depth
-	seen := map[string]bool{}
-	type node struct {
-		oid   string
-		depth int
+	for _, sb := range shallowBounds {
+		if obj, ok := r.Objs[sb]; ok && obj.typ == "commit" {
+			for _, p := range parseCommit(obj.data).Parents {
+				for oid := range r.closure([]string{p}) {
+					delete(held, oid)
+				}
+			}
+		}
 	}
+	effDepth := depth
+	if effDepth == 0 {
+		effDepth = -1
+	}
+	objSet := r.collect(wants, effDepth, held)
+	send = make([]string, 0, len(objSet))
+	for oid := range objSet {
+		send = append(send, oid)
+	}
+	if depth <= 0 {
+		return send, nil, nil
+	}
+	// boundary: sent commits at depth == depth (0-indexed d == depth-1)
+	type node struct {
+		oid string
+		d   int
+	}
+	seen := map[string]bool{}
 	var queue []node
 	for _, w := range wants {
-		queue = append(queue, node{w, 1})
+		queue = append(queue, node{w, 0})
+	}
+	sentSet := map[string]bool{}
+	for _, oid := range send {
+		sentSet[oid] = true
 	}
 	var boundary []string
 	for len(queue) > 0 {
@@ -1876,48 +1912,44 @@ func (r *Repo) fetchSet(wants []string, haves []string, depth int) (send []strin
 			continue
 		}
 		seen[cur.oid] = true
-		if held[cur.oid] {
-			continue
-		}
 		obj, ok := r.Objs[cur.oid]
 		if !ok {
 			continue
 		}
-		if obj.typ == "commit" {
-			send = append(send, cur.oid)
-			if depth > 0 && cur.depth == depth {
+		if obj.typ == "tag" {
+			if tgt := parseTagTarget(obj.data); tgt != "" {
+				queue = append(queue, node{tgt, cur.d})
+			}
+			continue
+		}
+		if obj.typ != "commit" {
+			continue
+		}
+		if cur.d == depth-1 {
+			if sentSet[cur.oid] {
 				boundary = append(boundary, cur.oid)
-				continue
 			}
-			for _, p := range parseCommit(obj.data).Parents {
-				queue = append(queue, node{p, cur.depth + 1})
+			continue
+		}
+		for _, p := range parseCommit(obj.data).Parents {
+			queue = append(queue, node{p, cur.d + 1})
+		}
+	}
+	shallow = boundary
+	// unshallow: old boundaries whose parent is now in the sent set
+	for _, s := range r.Shallow {
+		if seen[s] && !containsStr(boundary, s) {
+			if obj, ok := r.Objs[s]; ok && obj.typ == "commit" {
+				for _, p := range parseCommit(obj.data).Parents {
+					if sentSet[p] {
+						unshallow = append(unshallow, s)
+						break
+					}
+				}
 			}
 		}
 	}
-	// reachable objects (trees/blobs/tags) from send commits
-	objSet := map[string]bool{}
-	for _, oid := range send {
-		for o := range r.closure([]string{oid}) {
-			if !held[o] {
-				objSet[o] = true
-			}
-		}
-	}
-	send = send[:0]
-	for o := range objSet {
-		send = append(send, o)
-	}
-	// shallow boundary: deepest commits in set
-	if depth > 0 {
-		shallow = boundary
-		// unshallow: previous shallow boundaries that are now interior
-		for _, s := range r.Shallow {
-			if seen[s] && !containsStr(boundary, s) {
-				unshallow = append(unshallow, s)
-			}
-		}
-		r.Shallow = shallow
-	}
+	r.Shallow = shallow
 	return send, shallow, unshallow
 }
 
@@ -1932,7 +1964,7 @@ func containsStr(list []string, s string) bool {
 
 func (r *Repo) handleFetchV2(body []byte) []byte {
 	pr := &pktReader{data: body}
-	var wants, haves []string
+	var wants, haves, shallows []string
 	depth := 0
 	// first command line
 	line, _, err := pr.next()
@@ -1958,6 +1990,8 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 			wants = append(wants, strings.TrimPrefix(s, "want "))
 		case strings.HasPrefix(s, "have "):
 			haves = append(haves, strings.TrimPrefix(s, "have "))
+		case strings.HasPrefix(s, "shallow "):
+			shallows = append(shallows, strings.TrimPrefix(s, "shallow "))
 		case strings.HasPrefix(s, "deepen "):
 			if v, err := strconv.Atoi(strings.TrimPrefix(s, "deepen ")); err == nil {
 				depth = v
@@ -1965,7 +1999,7 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 		case s == "done":
 		}
 	}
-	send, shallow, unshallow := r.fetchSet(wants, haves, depth)
+	send, shallow, unshallow := r.fetchSet(wants, haves, shallows, depth)
 	var buf bytes.Buffer
 	buf.Write(pktLine([]byte("acknowledgments\n")))
 	buf.Write(pktLine([]byte("NAK\n")))
@@ -2008,7 +2042,7 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 
 func (r *Repo) handleFetchV0(body []byte) []byte {
 	pr := &pktReader{data: body}
-	var wants, haves []string
+	var wants, haves, shallows []string
 	depth := 0
 	// phase 1: want lines until flush
 	for {
@@ -2028,8 +2062,7 @@ func (r *Repo) handleFetchV0(body []byte) []byte {
 		case strings.HasPrefix(s, "want "):
 			wants = append(wants, strings.Fields(s)[1])
 		case strings.HasPrefix(s, "shallow "):
-			// client-declared shallow; treat as have-like
-			haves = append(haves, strings.TrimPrefix(s, "shallow "))
+			shallows = append(shallows, strings.TrimPrefix(s, "shallow "))
 		case strings.HasPrefix(s, "deepen "):
 			if v, err := strconv.Atoi(strings.TrimPrefix(s, "deepen ")); err == nil {
 				depth = v
@@ -2052,7 +2085,7 @@ func (r *Repo) handleFetchV0(body []byte) []byte {
 			break
 		}
 	}
-	send, shallow, unshallow := r.fetchSet(wants, haves, depth)
+	send, shallow, unshallow := r.fetchSet(wants, haves, shallows, depth)
 	var buf bytes.Buffer
 	buf.Write(pktLine([]byte("NAK\n")))
 	for _, s := range shallow {
@@ -2497,7 +2530,7 @@ func handleContents(req *request, r *Repo, rest []string, q map[string]string) *
 			status = 200
 		}
 		return jresp(status, map[string]interface{}{
-			"content": map[string]interface{}{"name": path[strings.LastIndex(path, "/")+1:], "path": path, "sha": blobOID, "size": len(content), "type": "file"},
+			"content": map[string]interface{}{"name": path[strings.LastIndex(path, "/")+1:], "path": path, "sha": blobOID, "size": len(content), "type": "file", "encoding": "base64"},
 			"commit":  map[string]interface{}{"sha": commitSHA, "message": msg},
 		})
 	case "DELETE":
@@ -2872,8 +2905,66 @@ func execGraphQL(doc map[string]interface{}) interface{} {
 	if vars == nil {
 		vars = map[string]interface{}{}
 	}
+	// mutations nest their arguments under `input`: unwrap one level
+	if input, ok := vars["input"].(map[string]interface{}); ok {
+		for k, v := range input {
+			if _, exists := vars[k]; !exists {
+				vars[k] = v
+			}
+		}
+	}
 	// operation name detection by content
 	q := query
+	// __type introspection (may appear several times, aliased, in one document)
+	if strings.Contains(q, "__type") {
+		data := map[string]interface{}{}
+		handled := false
+		for _, t := range []struct {
+			name   string
+			fields []string
+			enums  []string
+		}{
+			{"Issue", []string{"id", "number", "title", "body", "state", "url", "createdAt", "updatedAt", "closedAt", "author", "labels", "comments", "assignees"}, nil},
+			{"PullRequest", []string{"id", "number", "title", "body", "state", "headRefName", "baseRefName", "mergeable", "merged", "mergedAt", "mergeCommit", "files", "url", "headRef", "baseRef"}, nil},
+			{"Repository", []string{"id", "databaseId", "name", "nameWithOwner", "owner", "defaultBranchRef", "viewerPermission", "hasIssuesEnabled", "issue", "issues", "pullRequests", "pullRequest", "description", "url", "createdAt"}, nil},
+			{"SearchType", nil, []string{"ISSUE", "REPOSITORY", "USER", "DISCUSSION", "COMMIT", "CODE"}},
+		} {
+			needle := `__type(name: "` + t.name + `")`
+			idx := strings.Index(q, needle)
+			if idx < 0 {
+				continue
+			}
+			handled = true
+			alias := t.name
+			head := q[:idx]
+			if ci := strings.LastIndex(head, ":"); ci >= 0 {
+				a := strings.TrimSpace(head[:ci])
+				if sp := strings.LastIndexAny(a, " \t\n{"); sp >= 0 {
+					a = a[sp+1:]
+				}
+				if a != "" {
+					alias = a
+				}
+			}
+			rest := q[idx:]
+			if strings.Contains(rest, "enumValues") {
+				var ev []interface{}
+				for _, e := range t.enums {
+					ev = append(ev, map[string]interface{}{"name": e})
+				}
+				data[alias] = map[string]interface{}{"name": t.name, "enumValues": ev}
+			} else {
+				var fl []interface{}
+				for _, f := range t.fields {
+					fl = append(fl, map[string]interface{}{"name": f})
+				}
+				data[alias] = map[string]interface{}{"name": t.name, "fields": fl}
+			}
+		}
+		if handled {
+			return map[string]interface{}{"data": data}
+		}
+	}
 	switch {
 	case strings.Contains(q, "noSuchFieldOnViewer"):
 		return map[string]interface{}{"data": map[string]interface{}{"viewer": map[string]interface{}{"login": viewerLogin}}, "errors": []map[string]interface{}{{"message": "Cannot query field \"noSuchFieldOnViewer\" on type \"User\""}}}
