@@ -181,6 +181,7 @@ type Store struct {
 	order      []*Repo
 	nextRepoID int
 	nextID     int64 // global numeric id counter (issues, comments, PRs)
+	reqID      uint64
 	commitSeq  int64
 	repoSeq    int64
 	issueSeq   int64
@@ -191,6 +192,9 @@ type Store struct {
 var store = &Store{repos: map[string]*Repo{}, nextRepoID: 5000, nextID: 100000}
 
 func (s *Store) nextNumID() int { return int(atomic.AddInt64(&s.nextID, 1)) }
+func (s *Store) nextReqID() uint64 {
+	return atomic.AddUint64(&s.reqID, 1)
+}
 
 var authToken string
 
@@ -232,14 +236,8 @@ func oidOf(typ string, data []byte) string {
 }
 
 func compressObj(data []byte) []byte {
-	// BestCompression: the pack is built once and cached (fetch responses
-	// are singleflight-cached), so build cost is amortized; a smaller pack
-	// means fewer bytes for the client's 50 concurrent depth-1 clones to
-	// download and checksum. Measured on the real clone payload (512 B
-	// word-text blob + commit + tree): level 9 packs to ~407 B vs ~437 B
-	// at level 1 (~30 B saved per clone); the pack checksum still verifies.
 	var buf bytes.Buffer
-	w, _ := zlib.NewWriterLevel(&buf, 9)
+	w, _ := zlib.NewWriterLevel(&buf, 1)
 	w.Write(data)
 	w.Close()
 	return buf.Bytes()
@@ -1338,11 +1336,8 @@ func writeResponse(conn net.Conn, br *bufReader, req *request, resp *response) e
 	buf = append(buf, resp.ctype...)
 	buf = append(buf, "\r\nContent-Length: "...)
 	buf = strconv.AppendInt(buf, int64(len(resp.body)), 10)
-	// Fixed request id: the conformance suite only requires this header to be
-	// present and non-empty (checks-rest.ts protocol/request-id); a constant
-	// value drops one atomic increment on the shared counter per response
-	// (a cache-line bounce under 50-way concurrent clones) and a few bytes.
-	buf = append(buf, "\r\nX-GitHub-Request-Id: req-1"...)
+	buf = append(buf, "\r\nX-GitHub-Request-Id: req-"...)
+	buf = strconv.AppendUint(buf, store.nextReqID(), 10)
 	buf = append(buf, "\r\n"...)
 	for k, v := range resp.extra {
 		buf = append(buf, k...)
