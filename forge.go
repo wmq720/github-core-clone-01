@@ -168,9 +168,11 @@ type Repo struct {
 	Seq     int // repo creation order
 	Shallow []string
 	// packMu guards lazy zlib compression (Obj.comp) and the fetch cache below.
-	packMu    sync.Mutex
-	fetchKey  string
-	fetchResp []byte
+	packMu sync.Mutex
+	// fetchInflight tracks fetch builds in progress, for singleflight.
+	fetchInflight map[string]*fetchCall
+	fetchKey      string
+	fetchResp     []byte
 }
 
 type Store struct {
@@ -884,20 +886,43 @@ func fetchCacheKey(proto string, wants, haves, shallows []string, depth int) str
 	return sb.String()
 }
 
-func (r *Repo) fetchCached(key string) ([]byte, bool) {
-	r.packMu.Lock()
-	defer r.packMu.Unlock()
-	if r.fetchKey == key && r.fetchResp != nil {
-		return r.fetchResp, true
-	}
-	return nil, false
-}
+// fetchCall is one in-flight fetch build; waiters block on done.
+type fetchCall struct{ done chan struct{} }
 
-func (r *Repo) storeFetch(key string, resp []byte) {
+// fetchSingleflight builds the response for key once: the first caller runs
+// build (fetchSet + pack assembly) while concurrent callers for the same key
+// wait on the leader and then read the cached response. A 50-way clone burst
+// used to miss the cache 50 times and rebuild the same pack 50 times (the
+// builds serialized on packMu); now it builds once. Callers must hold no
+// locks: build runs without packMu, and the leader stores under packMu.
+func (r *Repo) fetchSingleflight(key string, build func() []byte) []byte {
 	r.packMu.Lock()
-	defer r.packMu.Unlock()
+	if r.fetchKey == key && r.fetchResp != nil {
+		resp := r.fetchResp
+		r.packMu.Unlock()
+		return resp
+	}
+	if call, ok := r.fetchInflight[key]; ok {
+		r.packMu.Unlock()
+		<-call.done
+		// The single-slot cache may since have been overwritten by a fetch
+		// of a different key; re-enter so a miss rebuilds as the new leader.
+		return r.fetchSingleflight(key, build)
+	}
+	call := &fetchCall{done: make(chan struct{})}
+	if r.fetchInflight == nil {
+		r.fetchInflight = map[string]*fetchCall{}
+	}
+	r.fetchInflight[key] = call
+	r.packMu.Unlock()
+	resp := build()
+	r.packMu.Lock()
 	r.fetchKey = key
 	r.fetchResp = resp
+	delete(r.fetchInflight, key)
+	r.packMu.Unlock()
+	close(call.done)
+	return resp
 }
 
 // ---------------------------------------------------------------- helpers
@@ -949,10 +974,18 @@ type request struct {
 	rawPath   string
 	query     string
 	proto     string
-	headers   map[string]string
 	body      []byte
 	host      string
 	keepAlive bool
+	// headers the handlers actually read, parsed into fixed fields: no
+	// per-request map[string]string alloc, no per-line string alloc.
+	// Unknown headers are dropped (no handler reads them).
+	authorization  string
+	contentLength  int // -1 when the header is absent
+	chunked        bool
+	expectContinue bool
+	connection     string
+	gitProtocol    string
 }
 
 type response struct {
@@ -963,24 +996,110 @@ type response struct {
 	// rawBody, when set, is written after headers without copying
 }
 
-func (r *request) header(name string) string { return r.headers[name] }
+// equalFoldBytes reports whether b equals s ignoring ASCII case.
+func equalFoldBytes(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != s[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// trimSpaceBytes trims ASCII spaces/tabs without allocating.
+func trimSpaceBytes(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t') {
+		b = b[1:]
+	}
+	for len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\t') {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// parseIntBytes parses a decimal integer; ok=false on any bad byte.
+func parseIntBytes(b []byte) (int, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	n := 0
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, true
+}
+
+// parseHexBytes parses a hex integer (chunk sizes); ok=false on bad input.
+func parseHexBytes(b []byte) (int64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	var n int64
+	for _, c := range b {
+		var v int64
+		switch {
+		case c >= '0' && c <= '9':
+			v = int64(c - '0')
+		case c >= 'a' && c <= 'f':
+			v = int64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v = int64(c-'A') + 10
+		default:
+			return 0, false
+		}
+		n = n*16 + v
+	}
+	return n, true
+}
+
+// containsChunked reports whether a Transfer-Encoding value names chunked,
+// compared case-insensitively without allocating.
+func containsChunked(b []byte) bool {
+	const want = "chunked"
+	for i := 0; i+len(want) <= len(b); i++ {
+		if equalFoldBytes(b[i:i+len(want)], want) {
+			return true
+		}
+	}
+	return false
+}
 
 func readRequest(br *bufReader) (*request, error) {
-	line, err := br.readLine()
+	line, err := br.readLineBytes()
 	if err != nil {
 		return nil, err
 	}
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) != 3 {
+	// request line: METHOD SP TARGET SP PROTO — scan bytes, no SplitN alloc.
+	sp1 := bytes.IndexByte(line, ' ')
+	if sp1 < 0 {
 		return nil, fmt.Errorf("bad request line")
 	}
-	req := &request{method: parts[0], proto: parts[2], headers: map[string]string{}}
-	rawTarget := parts[1]
-	if i := strings.Index(rawTarget, "?"); i >= 0 {
-		req.rawPath = rawTarget[:i]
-		req.query = rawTarget[i+1:]
+	sp2 := bytes.IndexByte(line[sp1+1:], ' ')
+	if sp2 < 0 {
+		return nil, fmt.Errorf("bad request line")
+	}
+	sp2 += sp1 + 1
+	req := &request{
+		method:        string(line[:sp1]),
+		proto:         string(line[sp2+1:]),
+		contentLength: -1,
+	}
+	rawTarget := line[sp1+1 : sp2]
+	if i := bytes.IndexByte(rawTarget, '?'); i >= 0 {
+		req.rawPath = string(rawTarget[:i])
+		req.query = string(rawTarget[i+1:])
 	} else {
-		req.rawPath = rawTarget
+		req.rawPath = string(rawTarget)
 	}
 	// percent-decode path segments (keep '/' structure); the common case has
 	// no '%' at all, so skip the split/decode round trip entirely.
@@ -995,72 +1114,99 @@ func readRequest(br *bufReader) (*request, error) {
 		}
 		req.path = strings.Join(segs, "/")
 	}
-	// headers
+	// headers: match names case-insensitively against the fixed set above.
 	for {
-		hline, err := br.readLine()
+		hline, err := br.readLineBytes()
 		if err != nil {
 			return nil, err
 		}
-		if hline == "" {
+		if len(hline) == 0 {
 			break
 		}
-		if i := strings.Index(hline, ":"); i >= 0 {
-			req.headers[strings.ToLower(strings.TrimSpace(hline[:i]))] = strings.TrimSpace(hline[i+1:])
+		i := bytes.IndexByte(hline, ':')
+		if i < 0 {
+			continue
+		}
+		name := trimSpaceBytes(hline[:i])
+		val := trimSpaceBytes(hline[i+1:])
+		switch {
+		case equalFoldBytes(name, "host"):
+			req.host = string(val)
+		case equalFoldBytes(name, "authorization"):
+			req.authorization = string(val)
+		case equalFoldBytes(name, "content-length"):
+			if n, ok := parseIntBytes(val); ok {
+				req.contentLength = n
+			}
+		case equalFoldBytes(name, "transfer-encoding"):
+			req.chunked = containsChunked(val)
+		case equalFoldBytes(name, "expect"):
+			req.expectContinue = equalFoldBytes(val, "100-continue")
+		case equalFoldBytes(name, "connection"):
+			req.connection = string(val)
+		case equalFoldBytes(name, "git-protocol"):
+			req.gitProtocol = string(val)
 		}
 	}
-	req.host = req.headers["host"]
-	if req.headers["expect"] == "100-continue" {
+	if req.expectContinue {
 		br.writeString("HTTP/1.1 100 Continue\r\n\r\n")
 	}
-	// body
-	if cl := req.headers["content-length"]; cl != "" {
-		n, _ := strconv.Atoi(cl)
-		if n > 0 {
-			if n > 64<<20 {
-				return nil, fmt.Errorf("body too large")
-			}
-			body, err := br.readN(n)
-			if err != nil {
-				return nil, err
-			}
-			req.body = body
+	// body, into the connection's reusable scratch: valid until the next
+	// request on this connection, which is all dispatch ever needs (every
+	// handler consumes req.body synchronously; stored objects never alias
+	// it — parsePack inflates into fresh slices).
+	if req.contentLength > 0 {
+		n := req.contentLength
+		if n > 64<<20 {
+			return nil, fmt.Errorf("body too large")
 		}
-	} else if strings.Contains(req.headers["transfer-encoding"], "chunked") {
-		var body []byte
+		body, err := br.readNInto(br.bodyBuf[:0], n)
+		if err != nil {
+			return nil, err
+		}
+		br.bodyBuf = body
+		req.body = body
+	} else if req.chunked {
+		body := br.bodyBuf[:0]
 		for {
-			szLine, err := br.readLine()
+			szLine, err := br.readLineBytes()
 			if err != nil {
 				return nil, err
 			}
-			szLine = strings.TrimSpace(strings.SplitN(szLine, ";", 2)[0])
-			sz, err := strconv.ParseInt(szLine, 16, 64)
-			if err != nil {
-				return nil, err
+			szLine = trimSpaceBytes(szLine)
+			if i := bytes.IndexByte(szLine, ';'); i >= 0 {
+				szLine = szLine[:i]
+			}
+			sz, ok := parseHexBytes(szLine)
+			if !ok {
+				return nil, fmt.Errorf("bad chunk size")
 			}
 			if sz == 0 {
 				// trailer headers until blank line
 				for {
-					l, err := br.readLine()
-					if err != nil || l == "" {
+					l, err := br.readLineBytes()
+					if err != nil || len(l) == 0 {
 						break
 					}
 				}
 				break
 			}
-			chunk, err := br.readN(int(sz))
+			body, err = br.readNInto(body, int(sz))
 			if err != nil {
 				return nil, err
 			}
-			body = append(body, chunk...)
 			// trailing CRLF
-			br.readN(2)
+			if _, err := br.readNInto(br.scratch[:0], 2); err != nil {
+				return nil, err
+			}
 		}
+		br.bodyBuf = body
 		req.body = body
 	}
 	if req.proto == "HTTP/1.1" {
-		req.keepAlive = req.headers["connection"] != "close"
+		req.keepAlive = !strings.EqualFold(req.connection, "close")
 	} else {
-		req.keepAlive = req.headers["connection"] == "keep-alive"
+		req.keepAlive = strings.EqualFold(req.connection, "keep-alive")
 	}
 	return req, nil
 }
@@ -1083,14 +1229,43 @@ func urlUnescape(s string) (string, error) {
 	return b.String(), nil
 }
 
-// bufReader: buffered reader over a conn with a small reusable buffer
+// bufReader: buffered reader over a conn with a small reusable buffer.
+// Readers are pooled: one 64KB buffer per live connection, reused across
+// connections instead of allocated per connection (a 50-way burst used to
+// allocate 3.2MB of throwaway buffers). bodyBuf/wbuf ride along so the
+// request/response hot path reuses them too; they are reset on Get.
 type bufReader struct {
 	conn net.Conn
 	buf  []byte
 	r, w int
+	// bodyBuf holds the current request body (valid until the next request
+	// on this connection); wbuf holds the current response headers.
+	bodyBuf []byte
+	wbuf    []byte
+	scratch [2]byte // trailing-CRLF scratch for chunked bodies
+	// lastDeadlineSet records when the read deadline was last set, for the
+	// lazy refresh in handleConn.
+	lastDeadlineSet time.Time
 }
 
-func newBufReader(c net.Conn) *bufReader { return &bufReader{conn: c, buf: make([]byte, 65536)} }
+var brPool = sync.Pool{New: func() any {
+	return &bufReader{buf: make([]byte, 65536)}
+}}
+
+func getBufReader(c net.Conn) *bufReader {
+	br := brPool.Get().(*bufReader)
+	br.conn = c
+	br.r, br.w = 0, 0
+	br.bodyBuf = br.bodyBuf[:0]
+	br.wbuf = br.wbuf[:0]
+	br.lastDeadlineSet = time.Time{}
+	return br
+}
+
+func putBufReader(br *bufReader) {
+	br.conn = nil
+	brPool.Put(br)
+}
 
 func (b *bufReader) fill() error {
 	if b.r > 0 {
@@ -1106,28 +1281,35 @@ func (b *bufReader) fill() error {
 	return err
 }
 
-func (b *bufReader) readLine() (string, error) {
+// readLineBytes returns the next line without allocating: the slice aliases
+// b.buf and is only valid until the next fill, so callers copy what they
+// keep. The trailing "\r" (if any) is trimmed by slicing, not by copying.
+func (b *bufReader) readLineBytes() ([]byte, error) {
 	for {
 		if i := bytes.IndexByte(b.buf[b.r:b.w], '\n'); i >= 0 {
-			line := string(b.buf[b.r : b.r+i])
+			line := b.buf[b.r : b.r+i]
 			b.r += i + 1
-			return strings.TrimRight(line, "\r"), nil
+			if n := len(line); n > 0 && line[n-1] == '\r' {
+				line = line[:n-1]
+			}
+			return line, nil
 		}
 		if err := b.fill(); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 }
 
-func (b *bufReader) readN(n int) ([]byte, error) {
-	out := make([]byte, 0, n)
-	for len(out) < n {
+// readNInto appends exactly n bytes into dst (reusing its capacity) and
+// returns the extended slice. dst is typically b.bodyBuf.
+func (b *bufReader) readNInto(dst []byte, n int) ([]byte, error) {
+	for len(dst) < n {
 		if b.r < b.w {
-			take := n - len(out)
+			take := n - len(dst)
 			if take > b.w-b.r {
 				take = b.w - b.r
 			}
-			out = append(out, b.buf[b.r:b.r+take]...)
+			dst = append(dst, b.buf[b.r:b.r+take]...)
 			b.r += take
 			continue
 		}
@@ -1135,15 +1317,16 @@ func (b *bufReader) readN(n int) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return out, nil
+	return dst, nil
 }
 
 func (b *bufReader) writeString(s string) { b.conn.Write([]byte(s)) }
 
-func writeResponse(conn net.Conn, req *request, resp *response) error {
-	// headers into a small buffer, then one writev of headers + body:
-	// no copy of the (possibly large) body.
-	buf := make([]byte, 0, 256)
+func writeResponse(conn net.Conn, br *bufReader, req *request, resp *response) error {
+	// headers into the connection's reusable buffer, then one writev of
+	// headers + body: no copy of the (possibly large) body, no per-response
+	// header alloc.
+	buf := br.wbuf[:0]
 	buf = append(buf, req.proto...)
 	buf = append(buf, ' ')
 	buf = strconv.AppendInt(buf, int64(resp.status), 10)
@@ -1170,6 +1353,7 @@ func writeResponse(conn net.Conn, req *request, resp *response) error {
 		buf = append(buf, "Connection: keep-alive\r\n"...)
 	}
 	buf = append(buf, "\r\n"...)
+	br.wbuf = buf
 	w := net.Buffers{buf, resp.body}
 	_, err := w.WriteTo(conn)
 	return err
@@ -1225,7 +1409,7 @@ func (s *Store) getRepo(owner, name string) *Repo {
 }
 
 func authed(req *request) bool {
-	h := req.headers["authorization"]
+	h := req.authorization
 	if !strings.HasPrefix(h, "Bearer ") {
 		return false
 	}
@@ -1241,6 +1425,29 @@ func authed(req *request) bool {
 
 // shared read-only empty query map (parseQuery's no-query fast path)
 var emptyQuery = map[string]string{}
+
+// queryValue scans a raw query string for one key without allocating a
+// map (the advertisement request on the clone hot path only needs
+// "service"). The returned value is still percent-encoded; callers that
+// need decoding fall back to parseQuery when it contains '%'.
+func queryValue(q, key string) (string, bool) {
+	for len(q) > 0 {
+		kv := q
+		if i := strings.IndexByte(q, '&'); i >= 0 {
+			kv, q = q[:i], q[i+1:]
+		} else {
+			q = ""
+		}
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			if kv[:i] == key {
+				return kv[i+1:], true
+			}
+		} else if kv == key {
+			return "", true
+		}
+	}
+	return "", false
+}
 
 func parseQuery(q string) map[string]string {
 	if q == "" {
@@ -2096,52 +2303,50 @@ func (r *Repo) handleFetchV2(body []byte) []byte {
 		}
 	}
 	// Identical fetches (the clone workload's 50 depth-1 clones of one tip)
-	// rebuild the same pack every time; serve the cached response instead.
+	// rebuild the same pack every time; build once per key and let the rest
+	// wait for it (singleflight), serving the cached response after that.
 	fetchKey := fetchCacheKey("v2", wants, haves, shallows, depth)
-	if cached, ok := r.fetchCached(fetchKey); ok {
-		return cached
-	}
-	send, shallow, unshallow := r.fetchSet(wants, haves, shallows, depth)
-	var buf bytes.Buffer
-	buf.Write(pktLine([]byte("acknowledgments\n")))
-	buf.Write(pktLine([]byte("NAK\n")))
-	buf.Write(pktDelim())
-	if len(shallow) > 0 || len(unshallow) > 0 {
-		buf.Write(pktLine([]byte("shallow-info\n")))
-		for _, s := range shallow {
-			buf.Write(pktLine([]byte("shallow " + s + "\n")))
-		}
-		for _, s := range unshallow {
-			buf.Write(pktLine([]byte("unshallow " + s + "\n")))
-		}
+	return r.fetchSingleflight(fetchKey, func() []byte {
+		send, shallow, unshallow := r.fetchSet(wants, haves, shallows, depth)
+		var buf bytes.Buffer
+		buf.Write(pktLine([]byte("acknowledgments\n")))
+		buf.Write(pktLine([]byte("NAK\n")))
 		buf.Write(pktDelim())
-	}
-	if len(send) > 0 {
-		buf.Write(pktLine([]byte("packfile\n")))
-		objs := map[string]*Obj{}
-		for _, oid := range send {
-			if o, ok := r.Objs[oid]; ok {
-				objs[oid] = o
+		if len(shallow) > 0 || len(unshallow) > 0 {
+			buf.Write(pktLine([]byte("shallow-info\n")))
+			for _, s := range shallow {
+				buf.Write(pktLine([]byte("shallow " + s + "\n")))
+			}
+			for _, s := range unshallow {
+				buf.Write(pktLine([]byte("unshallow " + s + "\n")))
+			}
+			buf.Write(pktDelim())
+		}
+		if len(send) > 0 {
+			buf.Write(pktLine([]byte("packfile\n")))
+			objs := map[string]*Obj{}
+			for _, oid := range send {
+				if o, ok := r.Objs[oid]; ok {
+					objs[oid] = o
+				}
+			}
+			pack := r.buildPack(objs)
+			// sideband: split into <=65515-byte chunks, band 1
+			for off := 0; off < len(pack); {
+				chunk := 65515
+				if len(pack)-off < chunk {
+					chunk = len(pack) - off
+				}
+				payload := make([]byte, 0, chunk+1)
+				payload = append(payload, 1)
+				payload = append(payload, pack[off:off+chunk]...)
+				buf.Write(pktLine(payload))
+				off += chunk
 			}
 		}
-		pack := r.buildPack(objs)
-		// sideband: split into <=65515-byte chunks, band 1
-		for off := 0; off < len(pack); {
-			chunk := 65515
-			if len(pack)-off < chunk {
-				chunk = len(pack) - off
-			}
-			payload := make([]byte, 0, chunk+1)
-			payload = append(payload, 1)
-			payload = append(payload, pack[off:off+chunk]...)
-			buf.Write(pktLine(payload))
-			off += chunk
-		}
-	}
-	buf.Write(pktFlush())
-	resp := buf.Bytes()
-	r.storeFetch(fetchKey, resp)
-	return resp
+		buf.Write(pktFlush())
+		return buf.Bytes()
+	})
 }
 
 func (r *Repo) handleFetchV0(body []byte) []byte {
@@ -2190,43 +2395,40 @@ func (r *Repo) handleFetchV0(body []byte) []byte {
 		}
 	}
 	fetchKey := fetchCacheKey("v0", wants, haves, shallows, depth)
-	if cached, ok := r.fetchCached(fetchKey); ok {
-		return cached
-	}
-	send, shallow, unshallow := r.fetchSet(wants, haves, shallows, depth)
-	var buf bytes.Buffer
-	buf.Write(pktLine([]byte("NAK\n")))
-	for _, s := range shallow {
-		buf.Write(pktLine([]byte("shallow " + s + "\n")))
-	}
-	for _, s := range unshallow {
-		buf.Write(pktLine([]byte("unshallow " + s + "\n")))
-	}
-	buf.Write(pktFlush())
-	if len(send) > 0 {
-		objs := map[string]*Obj{}
-		for _, oid := range send {
-			if o, ok := r.Objs[oid]; ok {
-				objs[oid] = o
+	return r.fetchSingleflight(fetchKey, func() []byte {
+		send, shallow, unshallow := r.fetchSet(wants, haves, shallows, depth)
+		var buf bytes.Buffer
+		buf.Write(pktLine([]byte("NAK\n")))
+		for _, s := range shallow {
+			buf.Write(pktLine([]byte("shallow " + s + "\n")))
+		}
+		for _, s := range unshallow {
+			buf.Write(pktLine([]byte("unshallow " + s + "\n")))
+		}
+		buf.Write(pktFlush())
+		if len(send) > 0 {
+			objs := map[string]*Obj{}
+			for _, oid := range send {
+				if o, ok := r.Objs[oid]; ok {
+					objs[oid] = o
+				}
+			}
+			pack := r.buildPack(objs)
+			for off := 0; off < len(pack); {
+				chunk := 65515
+				if len(pack)-off < chunk {
+					chunk = len(pack) - off
+				}
+				payload := make([]byte, 0, chunk+1)
+				payload = append(payload, 1)
+				payload = append(payload, pack[off:off+chunk]...)
+				buf.Write(pktLine(payload))
+				off += chunk
 			}
 		}
-		pack := r.buildPack(objs)
-		for off := 0; off < len(pack); {
-			chunk := 65515
-			if len(pack)-off < chunk {
-				chunk = len(pack) - off
-			}
-			payload := make([]byte, 0, chunk+1)
-			payload = append(payload, 1)
-			payload = append(payload, pack[off:off+chunk]...)
-			buf.Write(pktLine(payload))
-			off += chunk
-		}
-	}
-	buf.Write(pktFlush())
-	resp := buf.Bytes()
-	r.storeFetch(fetchKey, resp)
-	return resp
+		buf.Write(pktFlush())
+		return buf.Bytes()
+	})
 }
 
 func (r *Repo) handleReceivePack(body []byte) []byte {
@@ -2928,11 +3130,15 @@ func handleGit(req *request) *response {
 		if r == nil {
 			return jerr(404, "Not Found")
 		}
-		q := parseQuery(req.query)
-		service := q["service"]
+		// Only "service" is read here; scan for it instead of building a map.
+		service, _ := queryValue(req.query, "service")
+		if strings.Contains(service, "%") {
+			// percent-encoded value: fall back to the decoding parser.
+			service = parseQuery(req.query)["service"]
+		}
 		switch service {
 		case "git-upload-pack":
-			if req.headers["git-protocol"] == "version=2" {
+			if req.gitProtocol == "version=2" {
 				return jrawCT(200, gitUploadCT, v2AdvertiseBytes)
 			}
 			return jrawCT(200, gitUploadCT, r.advertisedRefs())
@@ -2947,7 +3153,7 @@ func handleGit(req *request) *response {
 		}
 		switch rest[0] {
 		case "git-upload-pack":
-			if req.headers["git-protocol"] == "version=2" {
+			if req.gitProtocol == "version=2" {
 				// peek first command
 				if len(req.body) >= 4 {
 					if pr := (&pktReader{data: req.body}); true {
@@ -3744,23 +3950,34 @@ func dispatch(req *request) *response {
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
-	br := newBufReader(conn)
+	br := getBufReader(conn)
+	defer putBufReader(br)
+	// Read deadline, set once per connection and refreshed lazily (only if
+	// 10s+ elapsed): the old code paid one setsockopt per request for this.
+	// The deadline only governs Reads, never the Write below, so there is
+	// still no clear after dispatch. A pooled keep-alive connection that
+	// idles still gets its deadline pushed out on next activity.
+	refreshDeadline := func() {
+		now := time.Now()
+		if now.Sub(br.lastDeadlineSet) >= 10*time.Second {
+			conn.SetReadDeadline(now.Add(30 * time.Second))
+			br.lastDeadlineSet = now
+		}
+	}
+	refreshDeadline()
 	for {
-		// read timeout to avoid hanging idle keep-alive forever
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		req, err := readRequest(br)
 		if err != nil {
 			return
 		}
-		// No deadline clear: the read deadline only governs Reads, never the
-		// Write below, so clearing it was one setsockopt per request for nothing.
 		resp := dispatch(req)
-		if err := writeResponse(conn, req, resp); err != nil {
+		if err := writeResponse(conn, br, req, resp); err != nil {
 			return
 		}
 		if !req.keepAlive {
 			return
 		}
+		refreshDeadline()
 	}
 }
 
@@ -3802,9 +4019,10 @@ func main() {
 			go handleConn(c)
 		}
 	}()
-	// poll done
+	// poll done: once a second is plenty (the old 200ms cadence fired five
+	// HTTP round trips a second against the env server for no benefit).
 	for {
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(1000 * time.Millisecond)
 		done, err := getDone(envURL + "/done")
 		if err == nil && done {
 			break
@@ -3813,9 +4031,13 @@ func main() {
 	os.Exit(0)
 }
 
+// envClient is shared by the register call and the /done polls: the old code
+// built a fresh http.Client (fresh Transport, fresh connection) per poll.
+var envClient = &http.Client{Timeout: 10 * time.Second}
+var doneClient = &http.Client{Timeout: 5 * time.Second}
+
 func postJSON(url string, body []byte) error {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := envClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -3828,8 +4050,7 @@ func postJSON(url string, body []byte) error {
 }
 
 func getDone(url string) (bool, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
+	resp, err := doneClient.Get(url)
 	if err != nil {
 		return false, err
 	}
