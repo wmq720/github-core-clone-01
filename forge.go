@@ -118,9 +118,6 @@ type Issue struct {
 	ID     int
 	GID    string
 	cache  []byte
-	// cacheVer bumps on every rebuildCache, so a per-connection fast path
-	// can tell in O(1) whether its cached body is still the live one.
-	cacheVer uint64
 }
 
 type FileChange struct {
@@ -176,19 +173,6 @@ type Repo struct {
 	fetchInflight map[string]*fetchCall
 	fetchKey      string
 	fetchResp     []byte
-	// refMu guards the ref-advertisement caches below. It is a separate
-	// mutex from packMu on purpose: packMu is held through zlib work in
-	// buildPack, and an advertisement must never queue behind a pack build.
-	// Every ref mutation invalidates these caches (see invalidateRefCache);
-	// building under refMu means a build can never store a snapshot that a
-	// concurrent invalidation has already superseded.
-	refMu      sync.Mutex
-	advUpload  []byte
-	advReceive []byte
-	lsCache    map[string][]byte
-	// deleted is set when the repo is removed via REST DELETE, so a
-	// per-connection fast path holding this repo pointer can tell it is gone.
-	deleted bool
 }
 
 type Store struct {
@@ -1262,17 +1246,6 @@ type bufReader struct {
 	// lastDeadlineSet records when the read deadline was last set, for the
 	// lazy refresh in handleConn.
 	lastDeadlineSet time.Time
-	// fastIssue caches the last single-issue GET served on this connection:
-	// its exact path, the repo/issue pointers, and the issue cache version
-	// at serve time. A repeat identical GET skips handleREST's Split,
-	// getRepo and findIssue. Only this connection's goroutine touches these
-	// fields. The entry is valid only while the issue's cacheVer is
-	// unchanged (rebuildCache bumps it on any issue/comment change) and
-	// the repo has not been deleted.
-	fastPath  string
-	fastRepo  *Repo
-	fastIssue *Issue
-	fastVer   uint64
 }
 
 var brPool = sync.Pool{New: func() any {
@@ -1286,12 +1259,6 @@ func getBufReader(c net.Conn) *bufReader {
 	br.bodyBuf = br.bodyBuf[:0]
 	br.wbuf = br.wbuf[:0]
 	br.lastDeadlineSet = time.Time{}
-	// A pooled reader must not carry the previous connection's fast path:
-	// its repo/issue pointers and path belong to a different client.
-	br.fastPath = ""
-	br.fastRepo = nil
-	br.fastIssue = nil
-	br.fastVer = 0
 	return br
 }
 
@@ -1612,10 +1579,6 @@ func (is *Issue) rebuildCache(r *Repo) {
 	sb.WriteString(strconv.Itoa(len(r.ComSeq[is.Number])))
 	sb.WriteByte('}')
 	is.cache = []byte(sb.String())
-	// Bump last, after the new bytes are in place: a fast-path reader that
-	// sees the new version also sees the new body, and one that sees the
-	// old version falls through to the normal path.
-	is.cacheVer++
 }
 
 func (pr *PR) toJSON(r *Repo) []byte {
@@ -1835,7 +1798,6 @@ func (r *Repo) squashMerge(pr *PR) (string, bool) {
 	commitData := []byte(fmt.Sprintf("tree %s\nparent %s\nauthor %s <%s> %d +0000\ncommitter %s <%s> %d +0000\n\n%s", newTree, baseTip, viewerName, viewerEmail, ts, viewerName, viewerEmail, ts, msg))
 	mergeSHA := r.putObj("commit", commitData)
 	r.Refs["refs/heads/"+pr.BaseRef] = mergeSHA
-	r.invalidateRefCache()
 	pr.State = "closed"
 	pr.Merged = true
 	pr.MergedAt = "2025-01-02T00:00:00Z"
@@ -1976,7 +1938,6 @@ func (r *Repo) contentsCommit(branch, path string, content []byte, message strin
 	cb.WriteString(fmt.Sprintf("author %s <%s> %d +0000\ncommitter %s <%s> %d +0000\n\n%s", viewerName, viewerEmail, ts, viewerName, viewerEmail, ts, message))
 	commitSHA := r.putObj("commit", []byte(cb.String()))
 	r.Refs["refs/heads/"+branch] = commitSHA
-	r.invalidateRefCache()
 	return commitSHA, blobOID
 }
 
@@ -2017,30 +1978,7 @@ func (r *Repo) rawRefs() [][2]string {
 	return out
 }
 
-// invalidateRefCache drops every cached byte string derived from r.Refs.
-// Call it after any successful ref change (push, contents commit, merge,
-// git-ref create) and after a ref delete. Callers must not hold refMu.
-func (r *Repo) invalidateRefCache() {
-	r.refMu.Lock()
-	r.advUpload = nil
-	r.advReceive = nil
-	r.lsCache = nil
-	r.refMu.Unlock()
-}
-
-// advertisedRefs returns the cached v0 upload-pack advertisement, building
-// it once per ref state. The bytes are byte-identical to the uncached build.
 func (r *Repo) advertisedRefs() []byte {
-	r.refMu.Lock()
-	defer r.refMu.Unlock()
-	if r.advUpload != nil {
-		return r.advUpload
-	}
-	r.advUpload = r.buildAdvertisedRefs()
-	return r.advUpload
-}
-
-func (r *Repo) buildAdvertisedRefs() []byte {
 	// v0 upload-pack advertisement
 	var buf bytes.Buffer
 	buf.Write(pktLine([]byte("# service=git-upload-pack\n")))
@@ -2071,19 +2009,7 @@ func (r *Repo) buildAdvertisedRefs() []byte {
 	return buf.Bytes()
 }
 
-// receiveAdvertisedRefs returns the cached v0 receive-pack advertisement,
-// building it once per ref state. Byte-identical to the uncached build.
 func (r *Repo) receiveAdvertisedRefs() []byte {
-	r.refMu.Lock()
-	defer r.refMu.Unlock()
-	if r.advReceive != nil {
-		return r.advReceive
-	}
-	r.advReceive = r.buildReceiveAdvertisedRefs()
-	return r.advReceive
-}
-
-func (r *Repo) buildReceiveAdvertisedRefs() []byte {
 	var buf bytes.Buffer
 	buf.Write(pktLine([]byte("# service=git-receive-pack\n")))
 	buf.Write(pktFlush())
@@ -2187,31 +2113,6 @@ func (r *Repo) handleLsRefs(body []byte) []byte {
 			prefixes = append(prefixes, strings.TrimPrefix(s, "ref-prefix "))
 		}
 	}
-	// The response is a pure function of (refs, peel, prefixes): the clone
-	// workload repeats the same ls-refs 150+ times on one repo. Cache it
-	// keyed by peel+prefixes; invalidateRefCache clears it on any ref change.
-	// (unborn/symrefs args do not affect the bytes this function emits, so
-	// they are deliberately not part of the key.)
-	key := "0\x00" + strings.Join(prefixes, "\x00")
-	if peel {
-		key = "1\x00" + strings.Join(prefixes, "\x00")
-	}
-	r.refMu.Lock()
-	defer r.refMu.Unlock()
-	if r.lsCache != nil {
-		if cached, ok := r.lsCache[key]; ok {
-			return cached
-		}
-	}
-	built := r.buildLsRefs(peel, prefixes)
-	if r.lsCache == nil {
-		r.lsCache = map[string][]byte{}
-	}
-	r.lsCache[key] = built
-	return built
-}
-
-func (r *Repo) buildLsRefs(peel bool, prefixes []string) []byte {
 	var buf bytes.Buffer
 	tip := r.tip("main")
 	// HEAD is only listed when no prefix filter is given or a prefix matches it
@@ -2601,9 +2502,6 @@ func (r *Repo) handleReceivePack(body []byte) []byte {
 			}
 		}
 	}
-	// Any successful ref change above makes the cached advertisements and
-	// ls-refs stale; drop them now so the next advertisement shows the new tip.
-	r.invalidateRefCache()
 	out.Write(pktFlush())
 	// wrap in sideband band 1
 	var wrapped bytes.Buffer
@@ -2688,9 +2586,6 @@ func handleREST(req *request) *response {
 			return jresp(200, r.toJSON())
 		case "DELETE":
 			store.mu.Lock()
-			if r, ok := store.repos[owner+"/"+repoName]; ok {
-				r.deleted = true
-			}
 			delete(store.repos, owner+"/"+repoName)
 			store.mu.Unlock()
 			return &response{status: 204, ctype: jsonCT, body: []byte{}}
@@ -2795,7 +2690,6 @@ func handleREST(req *request) *response {
 				store.mu.Lock()
 				r.Refs[body.Ref] = body.Sha
 				store.mu.Unlock()
-				r.invalidateRefCache()
 				return jresp(201, map[string]interface{}{"ref": body.Ref, "object": map[string]string{"sha": body.Sha, "type": "commit"}})
 			}
 		}
@@ -4029,34 +3923,7 @@ func mcpCall(id interface{}, name string, args map[string]interface{}) *response
 
 var serverPort int
 
-// maybeCacheIssue records a just-served single-issue GET in the
-// connection's fast path, but only when the response body is exactly the
-// issue's live cache slice. Anything else (404, list, other shapes) leaves
-// the fast path untouched.
-func (br *bufReader) maybeCacheIssue(req *request, resp *response) {
-	segs := strings.Split(strings.Trim(req.path, "/"), "/")
-	if len(segs) != 7 || segs[0] != "api" || segs[1] != "v3" || segs[2] != "repos" || segs[5] != "issues" {
-		return
-	}
-	n, err := strconv.Atoi(segs[6])
-	if err != nil {
-		return
-	}
-	r := store.getRepo(segs[3], segs[4])
-	if r == nil {
-		return
-	}
-	is := r.findIssue(n)
-	if is == nil || len(resp.body) == 0 || len(is.cache) != len(resp.body) || &resp.body[0] != &is.cache[0] {
-		return
-	}
-	br.fastPath = req.path
-	br.fastRepo = r
-	br.fastIssue = is
-	br.fastVer = is.cacheVer
-}
-
-func dispatch(req *request, br *bufReader) *response {
+func dispatch(req *request) *response {
 	// healthz first, no auth
 	if req.path == "/healthz" {
 		return &response{status: 200, ctype: "text/plain", body: []byte("ok")}
@@ -4064,18 +3931,6 @@ func dispatch(req *request, br *bufReader) *response {
 	// auth for everything else (except /healthz)
 	if !authed(req) {
 		return jerr(401, "Bad credentials")
-	}
-	// Per-connection single-issue fast path (read workload: 2000 identical
-	// GETs). Auth above still runs every time; only the route resolution
-	// is skipped, and only while the cached body is still the live one.
-	if req.method == "GET" && br != nil && br.fastIssue != nil && req.path == br.fastPath {
-		is := br.fastIssue
-		if !br.fastRepo.deleted && is.cacheVer == br.fastVer {
-			return jraw(200, is.cache)
-		}
-		br.fastIssue = nil
-		br.fastRepo = nil
-		br.fastPath = ""
 	}
 	switch {
 	case req.path == "/api/graphql":
@@ -4086,11 +3941,7 @@ func dispatch(req *request, br *bufReader) *response {
 	case req.path == "/mcp":
 		return handleMCP(req)
 	case strings.HasPrefix(req.path, "/api/v3"):
-		resp := handleREST(req)
-		if br != nil && req.method == "GET" && resp.status == 200 {
-			br.maybeCacheIssue(req, resp)
-		}
-		return resp
+		return handleREST(req)
 	case strings.Contains(req.path, ".git/"):
 		return handleGit(req)
 	}
@@ -4119,7 +3970,7 @@ func handleConn(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		resp := dispatch(req, br)
+		resp := dispatch(req)
 		if err := writeResponse(conn, br, req, resp); err != nil {
 			return
 		}
