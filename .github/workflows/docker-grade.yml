@@ -43,13 +43,14 @@ jobs:
           tar -xzf kit.tar.gz -C kit --strip-components=1
           ls kit
 
-      - name: Grade with docker driver (3 instances)
+      - name: Grade with docker driver (1 instance, diagnostic)
         run: |
           node kit/cli/makefun.mjs grade-local \
             --kit kit \
             --bot . \
             --driver docker \
-            --instances 3 \
+            --instances 1 \
+            --save grade-save \
             --json > grade-docker.json
           cat grade-docker.json
 
@@ -58,3 +59,9 @@ jobs:
         with:
           name: grade-docker
           path: grade-docker.json
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: grade-save
+          path: grade-save
