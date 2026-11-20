@@ -2541,7 +2541,7 @@ func handleREST(req *request) *response {
 	}
 	if segs[0] == "user" && len(segs) == 2 && segs[1] == "repos" {
 		if req.method == "GET" {
-			return handleListUserRepos(q)
+			return handleListUserRepos(req, q)
 		}
 		if req.method == "POST" {
 			return handleCreateRepo(req, viewerLogin)
@@ -2698,7 +2698,7 @@ func handleREST(req *request) *response {
 	return jerr(404, "Not Found")
 }
 
-func handleListUserRepos(q map[string]string) *response {
+func handleListUserRepos(req *request, q map[string]string) *response {
 	page := queryInt(q, "page", 1)
 	perPage := queryInt(q, "per_page", 30)
 	if perPage > 100 {
@@ -2728,7 +2728,10 @@ func handleListUserRepos(q map[string]string) *response {
 	}
 	resp := jresp(200, out)
 	if end < total {
-		host := "http://127.0.0.1:" + strconv.Itoa(serverPort)
+		host := "http://" + req.host
+		if req.host == "" {
+			host = "http://127.0.0.1:" + strconv.Itoa(serverPort)
+		}
 		resp.extra = map[string]string{"Link": fmt.Sprintf(`<%s/api/v3/user/repos?per_page=%d&page=%d>; rel="next"`, host, perPage, page+1)}
 	}
 	return resp
@@ -3993,7 +3996,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "MAKEFUN_SHOP_TOKEN not set")
 		os.Exit(1)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
