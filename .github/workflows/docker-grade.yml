@@ -1,0 +1,58 @@
+# GitHub Actions workflow: run make.fun grade-local with the docker driver
+# for github-core-clone-01, to measure the process->docker calibration.
+# Draft prepared 2026-11-20. To use: push the clone repo to GitHub (public
+# repo = unlimited Actions minutes, no card), add this file at
+# .github/workflows/docker-grade.yml, then run it from the Actions tab
+# (workflow_dispatch) or push a commit.
+#
+# What it does:
+# - checks out the repo (the bot: Go forge + Node launcher)
+# - downloads the published dev kit for github-core-clone-01
+# - runs grade-local with --driver docker --instances 3 --json
+# - uploads the result JSON as an artifact
+#
+# Cost: ~10-20 min per run. Public repo = unlimited minutes.
+# Pin ubuntu-24.04 (shared-runner timing has noise; calibration is
+# order-of-magnitude only, not a precise number).
+
+name: Docker grade (github-core-clone-01)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  grade:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+
+      - name: Download dev kit
+        run: |
+          curl -sL -o kit.tar.gz "https://make.fun/c/github-core-clone-01/kit"
+          mkdir -p kit
+          tar -xzf kit.tar.gz -C kit --strip-components=1
+          ls kit
+
+      - name: Grade with docker driver (3 instances)
+        run: |
+          node kit/cli/makefun.mjs grade-local \
+            --kit kit \
+            --bot . \
+            --driver docker \
+            --instances 3 \
+            --json > grade-docker.json
+          cat grade-docker.json
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: grade-docker
+          path: grade-docker.json
