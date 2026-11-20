@@ -43,6 +43,17 @@ jobs:
           tar -xzf kit.tar.gz -C kit --strip-components=1
           ls kit
 
+      - name: Diagnose bot startup in node:22-slim
+        run: |
+          echo "--- node version in image ---"
+          docker run --rm node:22-slim node --version
+          echo "--- files + exec bit ---"
+          docker run --rm -v "$PWD:/bot" -w /bot node:22-slim ls -la forge main.ts
+          echo "--- run forge directly (dummy env, expect register failed) ---"
+          docker run --rm -v "$PWD:/bot" -w /bot -e MAKEFUN_SHOP_TOKEN=test -e MAKEFUN_ENV_URL=http://127.0.0.1:1 node:22-slim timeout 10 ./forge; echo "FORGE EXIT: $?"
+          echo "--- run via launcher ---"
+          docker run --rm -v "$PWD:/bot" -w /bot -e MAKEFUN_SHOP_TOKEN=test -e MAKEFUN_ENV_URL=http://127.0.0.1:1 node:22-slim timeout 10 node main.ts; echo "LAUNCHER EXIT: $?"
+
       - name: Grade with docker driver (1 instance, diagnostic)
         run: |
           node kit/cli/makefun.mjs grade-local \
