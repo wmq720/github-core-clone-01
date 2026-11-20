@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # grade-local needs full history down to the makefun beacon root; shallow clone fails the fetch
 
       - uses: actions/setup-node@v4
         with:
